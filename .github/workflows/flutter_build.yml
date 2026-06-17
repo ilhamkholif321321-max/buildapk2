@@ -165,13 +165,16 @@ jobs:
         with:
           node-version: "24"
 
+      # ==========================================================
+      # STEP 1: DOWNLOAD ZIP DENGAN RETRY & LOGGING
+      # ==========================================================
       - name: Download ZIP project
         id: download_zip
         run: |
           echo "=== Downloading ZIP (Runner ${{ matrix.runner_id }}) ==="
           echo "URL: ${{ github.event.inputs.zip_url }}"
 
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             echo "Attempt $i..."
             
             curl -L \
@@ -187,36 +190,89 @@ jobs:
             fi
             
             echo "❌ Download failed, retrying..."
-            sleep 2
+            sleep 3
           done
+
+          echo ""
+          echo "=== File Info ==="
+          ls -lh project.zip || echo "❌ File not found!"
+
+          echo ""
+          echo "=== File Type ==="
+          file project.zip || echo "❌ Cannot determine file type"
+
+          echo ""
+          echo "=== First 100 bytes ==="
+          xxd project.zip | head -10 || echo "❌ Cannot read file"
 
           if [ ! -f "project.zip" ] || [ ! -s "project.zip" ]; then
             echo "❌ ERROR: File ZIP kosong atau tidak terdownload!"
+            echo "FAILURE: Download failed"
             exit 1
           fi
 
+      # ==========================================================
+      # STEP 2: VALIDASI & EXTRACT ZIP DENGAN DETAIL
+      # ==========================================================
       - name: Validate and Extract ZIP
         id: extract_zip
         run: |
           echo "=== Validating ZIP (Runner ${{ matrix.runner_id }}) ==="
 
+          # Cek apakah file benar-benar ZIP
           if ! file project.zip | grep -q "Zip archive"; then
             echo "❌ File bukan ZIP archive!"
+            echo ""
+            echo "=== File content preview ==="
+            head -c 500 project.zip
+            echo ""
+            echo "FAILURE: Invalid ZIP file"
             exit 1
           fi
 
+          # Test ZIP integrity
           if ! unzip -t project.zip > /dev/null 2>&1; then
             echo "❌ File ZIP corrupt atau tidak valid!"
+            echo ""
+            echo "=== Trying to list content anyway ==="
+            unzip -l project.zip || true
+            echo ""
+            echo "FAILURE: Corrupt ZIP file"
             exit 1
           fi
 
           echo "✅ ZIP valid"
+
+          echo ""
+          echo "=== Extracting ZIP ==="
           unzip -q project.zip -d project_raw
 
+          echo ""
+          echo "=== Isi folder project_raw (files) ==="
+          find project_raw -type f | head -50
+
+          echo ""
+          echo "=== Struktur folder ==="
+          find project_raw -type d | head -20
+
+          # Cek apakah ada pubspec.yaml
           echo ""
           echo "=== Mencari pubspec.yaml ==="
           find project_raw -name "pubspec.yaml" | head -5
 
+          # Cek apakah ada android folder
+          echo ""
+          echo "=== Mencari android folder ==="
+          find project_raw -name "android" -type d | head -5
+
+          # Cek apakah ada ios folder
+          echo ""
+          echo "=== Mencari ios folder ==="
+          find project_raw -name "ios" -type d | head -5
+
+          echo ""
+          echo "=== Mengunci Project Dir (Manut Mode) ==="
+          
           SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
           FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
           
@@ -229,6 +285,21 @@ jobs:
           echo "✅ Project root: $PROJECT_DIR"
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
 
+          # Cek apakah pubspec.yaml ada di PROJECT_DIR
+          if [ ! -f "$PROJECT_DIR/pubspec.yaml" ]; then
+            echo "⚠️ WARNING: pubspec.yaml tidak ditemukan di root project!"
+            echo "⚠️ Mencari pubspec.yaml di subfolder..."
+            find project_raw -name "pubspec.yaml" | head -5
+          else
+            echo "✅ pubspec.yaml ditemukan!"
+            echo ""
+            echo "=== Isi pubspec.yaml (head 20 lines) ==="
+            head -20 "$PROJECT_DIR/pubspec.yaml"
+          fi
+
+      # ==========================================================
+      # STEP 3: SETUP JAVA & FLUTTER
+      # ==========================================================
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -243,8 +314,12 @@ jobs:
           cache: true
 
       - name: Flutter Doctor
-        run: flutter doctor -v || true
+        run: |
+          flutter doctor -v || true
 
+      # ==========================================================
+      # STEP 4: FLUTTER PUB GET DENGAN LOG LENGKAP
+      # ==========================================================
       - name: Get dependencies
         working-directory: ${{ env.PROJECT_DIR }}
         id: pub_get
@@ -253,18 +328,45 @@ jobs:
           echo "=== Running flutter pub get (Runner ${{ matrix.runner_id }}) ==="
           
           if [ -f "pubspec.yaml" ]; then
-            timeout 180s flutter pub get --verbose 2>&1 | tee pub_get.log
+            echo "✅ pubspec.yaml found!"
             
+            echo ""
+            echo "=== Flutter version ==="
+            flutter --version
+            
+            echo ""
+            echo "=== Running flutter pub get ==="
+            
+            # Run with timeout and capture output
+            timeout 300s flutter pub get --verbose 2>&1 | tee pub_get.log
+            
+            # Check if success
             if [ $? -ne 0 ]; then
               echo "❌ flutter pub get failed!"
-              tail -50 pub_get.log
+              echo ""
+              echo "=== Last 100 lines of log ==="
+              tail -100 pub_get.log
+              echo ""
+              echo "FAILURE: flutter pub get failed"
               exit 1
             fi
+            
             echo "✅ flutter pub get success!"
+            
+            echo ""
+            echo "=== Running flutter pub outdated ==="
+            flutter pub outdated || true
+            
           else
-            echo "⚠️ Bukan project Flutter standar"
+            echo "⚠️ Bukan project Flutter standar (pubspec.yaml tidak ditemukan)"
+            echo ""
+            echo "=== Isi folder project ==="
+            ls -la
           fi
 
+      # ==========================================================
+      # STEP 5: BUILD APK DENGAN LOG LENGKAP
+      # ==========================================================
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
         id: build_apk
@@ -272,22 +374,36 @@ jobs:
         run: |
           echo "=== Building APK (Runner ${{ matrix.runner_id }}) ==="
           echo "Mode: ${{ github.event.inputs.build_type }}"
+          echo ""
 
           if [ -f "pubspec.yaml" ]; then
             echo "🔥 Project Flutter Terdeteksi!"
+            echo ""
+            echo "=== Running flutter build ==="
+            
             flutter build apk --${{ github.event.inputs.build_type }} --verbose 2>&1 | tee build.log
             
             if [ $? -ne 0 ]; then
               echo "❌ Flutter build failed!"
-              tail -100 build.log
+              echo ""
+              echo "=== Last 200 lines of build log ==="
+              tail -200 build.log
+              echo ""
+              echo "FAILURE: Flutter build failed"
               exit 1
             fi
+            
           else
             echo "☕ Project Native Android Terdeteksi!"
             GRADLE_PATH=$(find . -name "gradlew" | head -n 1)
             
             if [ -z "$GRADLE_PATH" ]; then
               echo "❌ ERROR: File 'gradlew' tidak ditemukan!"
+              echo ""
+              echo "=== Isi folder project ==="
+              ls -la
+              echo ""
+              echo "FAILURE: gradlew not found"
               exit 1
             fi
             
@@ -295,34 +411,62 @@ jobs:
             cd "$GRADLE_DIR"
             chmod +x gradlew
             
+            echo "🚀 Membakar APK menggunakan Gradle Native..."
             if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
-              ./gradlew assembleDebug --stacktrace
+              ./gradlew assembleDebug --stacktrace 2>&1 | tee build.log
             else
-              ./gradlew assembleRelease --stacktrace
+              ./gradlew assembleRelease --stacktrace 2>&1 | tee build.log
             fi
             
             if [ $? -ne 0 ]; then
               echo "❌ Gradle build failed!"
+              echo ""
+              echo "=== Last 200 lines of build log ==="
+              tail -200 build.log
+              echo ""
+              echo "FAILURE: Gradle build failed"
               exit 1
             fi
             cd -
           fi
 
-      - name: Find and Upload APK
-        id: upload_apk
+      # ==========================================================
+      # STEP 6: FIND APK DENGAN DETAIL
+      # ==========================================================
+      - name: Check APK Output
+        id: check_apk
         run: |
-          echo "=== Mencari APK (Runner ${{ matrix.runner_id }}) ==="
+          echo "=== APK Output Scanning (Runner ${{ matrix.runner_id }}) ==="
+
+          echo "Mencari file APK di seluruh direktori..."
+          find $GITHUB_WORKSPACE -name "*.apk" -type f
+
           APK_FOUND=$(find $GITHUB_WORKSPACE -name "*.apk" -type f | head -n 1)
 
           if [ -z "$APK_FOUND" ]; then
-            echo "❌ ERROR: Tidak ada file APK!"
+            echo "❌ ERROR: Tidak ada file APK yang ditemukan!"
+            echo ""
+            echo "=== Build output directories ==="
+            find ${{ env.PROJECT_DIR }}/build -type d 2>/dev/null || echo "No build folder"
+            echo ""
+            echo "=== Search all *.apk ==="
+            find /home/runner -name "*.apk" -type f 2>/dev/null || echo "No APK found anywhere"
+            echo ""
+            echo "FAILURE: No APK found"
             exit 1
           fi
 
           APK_PATH=$(echo "$APK_FOUND" | sed "s|$GITHUB_WORKSPACE/||")
-          echo "✅ APK ditemukan: $APK_PATH"
+
+          echo "✅ APK Sukses Ditemukan!"
+          echo "Path: $APK_PATH"
+          echo "Size: $(ls -lh "$APK_FOUND" | awk '{print $5}')"
+          
           echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
 
+      # ==========================================================
+      # STEP 7: UPLOAD APK KE ARTIFACT
+      # ==========================================================
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -331,17 +475,44 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      - name: Upload build logs on failure
+      # ==========================================================
+      # STEP 8: UPLOAD SEMUA LOG JIKA FAILED
+      # ==========================================================
+      - name: Upload all logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-runner${{ matrix.runner_id }}
+          name: build-logs-runner${{ matrix.runner_id }}-${{ github.run_id }}
           path: |
             ${{ env.PROJECT_DIR }}/pub_get.log
             ${{ env.PROJECT_DIR }}/build.log
             ${{ env.PROJECT_DIR }}/**/*.log
+            ${{ env.PROJECT_DIR }}/**/*.txt
+            ${{ github.workspace }}/**/*.log
+            /home/runner/.flutter-debug.log
+            /home/runner/.pub-cache/**/*.log
           retention-days: 7
           if-no-files-found: ignore
+
+      # ==========================================================
+      # STEP 9: BUILD INFO
+      # ==========================================================
+      - name: Build Info
+        if: always()
+        run: |
+          echo "========================================="
+          echo "Runner ID: ${{ matrix.runner_id }}"
+          echo "Build Type: ${{ github.event.inputs.build_type }}"
+          echo "Tag: ${{ github.event.inputs.tag }}"
+          echo "Status: ${{ job.status }}"
+          echo "========================================="
+          if [ "${{ job.status }}" != "success" ]; then
+            echo ""
+            echo "⚠️ Build failed! Check logs above."
+            echo ""
+            echo "=== Last 50 lines of build.log (if exists) ==="
+            tail -50 ${{ env.PROJECT_DIR }}/build.log 2>/dev/null || echo "No build.log found"
+          fi
 
   # ==========================================================
   # 🔥 MERGE APK - AMBIL 1 APK PERTAMA YANG VALID
@@ -366,6 +537,7 @@ jobs:
         run: |
           echo "=== Mencari APK dari semua artifacts ==="
           
+          # Cari semua APK
           APKS=$(find all-artifacts -name "*.apk" -type f)
           APK_COUNT=$(echo "$APKS" | wc -l)
           
@@ -373,32 +545,47 @@ jobs:
           
           if [ "$APK_COUNT" -eq 0 ]; then
             echo "❌ ERROR: Tidak ada APK ditemukan!"
+            echo ""
+            echo "=== Isi all-artifacts ==="
+            ls -la all-artifacts/
             exit 1
           fi
           
-          # Cari APK yang valid (minimal 1MB)
+          # Cari APK yang valid (minimal 500KB)
           VALID_APK=""
           for apk in $APKS; do
             SIZE=$(stat -c%s "$apk" 2>/dev/null || stat -f%z "$apk" 2>/dev/null)
-            SIZE_MB=$((SIZE / 1024 / 1024))
+            SIZE_KB=$((SIZE / 1024))
             
-            echo "📦 $(basename "$apk") - ${SIZE_MB}MB"
+            echo "📦 $(basename "$apk") - ${SIZE_KB}KB"
             
-            if [ "$SIZE_MB" -gt 0 ]; then
+            # APK minimal 500KB (anggap valid)
+            if [ "$SIZE_KB" -gt 500 ]; then
               VALID_APK="$apk"
-              echo "✅ APK valid: $(basename "$apk") (${SIZE_MB}MB)"
+              echo "✅ APK valid: $(basename "$apk") (${SIZE_KB}KB)"
               break
             fi
           done
           
           if [ -z "$VALID_APK" ]; then
-            echo "❌ ERROR: Tidak ada APK yang valid!"
+            echo "❌ ERROR: Tidak ada APK yang valid (minimal 500KB)!"
+            echo ""
+            echo "=== Semua APK yang ditemukan ==="
+            for apk in $APKS; do
+              SIZE=$(stat -c%s "$apk" 2>/dev/null || stat -f%z "$apk" 2>/dev/null)
+              echo "$(basename "$apk"): ${SIZE} bytes"
+            done
             exit 1
           fi
           
+          # Copy APK valid ke root dengan nama standar
           cp "$VALID_APK" "app-${{ github.event.inputs.build_type }}.apk"
           
           echo "APK_PATH=app-${{ github.event.inputs.build_type }}.apk" >> $GITHUB_ENV
+          
+          echo ""
+          echo "=== Final APK Info ==="
+          ls -lh "app-${{ github.event.inputs.build_type }}.apk"
 
       - name: Upload final APK
         uses: actions/upload-artifact@v4
@@ -408,8 +595,11 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      - name: List artifacts
+      - name: List all artifacts
         run: |
+          echo "=== Semua Artifact ==="
+          ls -la all-artifacts/
+          echo ""
           echo "=== Final APK ==="
           ls -la app-${{ github.event.inputs.build_type }}.apk
 
@@ -442,7 +632,7 @@ jobs:
             console.log(`📊 Menemukan ${deleteArtifacts.length} artifact untuk dihapus`);
             
             for (const artifact of deleteArtifacts) {
-              console.log(`🗑️ Menghapus: ${artifact.name}`);
+              console.log(`🗑️ Menghapus: ${artifact.name} (${artifact.size_in_bytes} bytes)`);
               await github.rest.actions.deleteArtifact({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -451,3 +641,15 @@ jobs:
             }
             
             console.log('✅ Cleanup selesai!');
+            
+            // Tampilkan artifact yang tersisa
+            const { data: remaining } = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+            
+            console.log(`📊 Artifact tersisa: ${remaining.artifacts.length}`);
+            for (const art of remaining.artifacts) {
+              console.log(`  ✅ ${art.name}`);
+            }
